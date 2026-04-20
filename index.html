@@ -673,14 +673,27 @@ select.form-input {
 
 <script>
 // ══════════════════════════════════
-//  CONFIG — placeholders to swap later
+//  CONFIG
 // ══════════════════════════════════
-const SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/PLACEHOLDER_SHEET_URL_GOES_HERE/exec';
+const SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyksTv1BOgViYujucy92mE7ieLjy9EWVGAFh123iFat2Um7UxaweN15QQQf74oPiYtmrw/exec';
+
+// ══════════════════════════════════
+//  SESSION ID — persisted so refreshes keep the same sheet row
+// ══════════════════════════════════
+function getSessionId() {
+  let id = sessionStorage.getItem('vp_session_id');
+  if (!id) {
+    id = 'vp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem('vp_session_id', id);
+  }
+  return id;
+}
 
 // ══════════════════════════════════
 //  STATE
 // ══════════════════════════════════
 const state = {
+  session_id: getSessionId(),
   step: 1,
   maxVisited: 1,
   goal1: null,
@@ -691,10 +704,12 @@ const state = {
   propertyCounts: {},
   routePlacements: {},
   density: null,
+  projection: null,
 };
 
 const TOTAL_STEPS = 3;
 const STEP_LABELS = ['About You', 'Goals & Route', 'Projection'];
+const STEP_NAMES_MAP = { 1: 'About You', 2: 'Goals & Route', 3: 'Projection' };
 
 // ══════════════════════════════════
 //  PROPERTY / MACHINE / DPM DATA
@@ -858,8 +873,14 @@ const GOAL_MACHINE_MAP = {
   family: 11,
   scale: 13,
 };
-// Two-goal weights — same ratio as the original 1st/2nd from the 4-rank system
 const RANK_WEIGHTS = [3, 2];
+
+const GOAL_LABELS = {
+  supplemental: 'Supplemental Income',
+  replace: 'Replace Day Job',
+  family: 'Family Business',
+  scale: 'Scale & Sell',
+};
 
 // ══════════════════════════════════
 //  INIT
@@ -923,7 +944,8 @@ function nextStep() {
   if (state.step === 1 && !validateStep1()) return;
   if (state.step === 2 && !validateStep2()) return;
 
-  sendToSheet(state.step);
+  // Send the step we're leaving
+  sendToSheet(state.step, state.step === TOTAL_STEPS ? 'completed' : 'in_progress');
 
   if (state.step < TOTAL_STEPS) {
     state.step++;
@@ -942,9 +964,7 @@ function prevStep() {
 
 function jumpToStep(n) {
   if (n === state.step || n < 1 || n > TOTAL_STEPS) return;
-  // Only allow jumping to visited steps or backward
   if (n > state.maxVisited) return;
-  // Validate before jumping forward past current
   if (n > state.step) {
     if (state.step === 1 && !validateStep1()) return;
     if (state.step === 2 && !validateStep2()) return;
@@ -1006,7 +1026,6 @@ function validateStep2() {
   let ok = true;
   let firstBadEl = null;
 
-  // goal 1
   const g1 = document.getElementById('goal1').value;
   if (!g1) {
     document.getElementById('goal1').classList.add('error');
@@ -1017,7 +1036,6 @@ function validateStep2() {
     document.getElementById('goal1Error').style.display = 'none';
   }
 
-  // goal 2 — required and must differ from g1
   const g2 = document.getElementById('goal2').value;
   if (!g2 || g2 === g1) {
     document.getElementById('goal2').classList.add('error');
@@ -1031,7 +1049,6 @@ function validateStep2() {
     document.getElementById('goal2Error').style.display = 'none';
   }
 
-  // desired profit
   if (!state.desiredProfit || state.desiredProfit <= 0) {
     document.getElementById('fnDesiredProfit').classList.add('error');
     document.getElementById('profitError').style.display = 'block';
@@ -1041,7 +1058,6 @@ function validateStep2() {
     document.getElementById('profitError').style.display = 'none';
   }
 
-  // route — at least one placement with units AND machine
   const validPlacements = Object.values(state.routePlacements || {}).filter(p => p.property && p.machine && p.units > 0);
   if (validPlacements.length === 0) {
     document.getElementById('routeError').style.display = 'block';
@@ -1051,7 +1067,6 @@ function validateStep2() {
     document.getElementById('routeError').style.display = 'none';
   }
 
-  // density
   if (!state.density) {
     document.getElementById('densityError').style.display = 'block';
     ok = false;
@@ -1085,7 +1100,6 @@ function formatPhone(input) {
 function syncGoals() {
   state.goal1 = document.getElementById('goal1').value || null;
   state.goal2 = document.getElementById('goal2').value || null;
-  // clear error states on change
   document.getElementById('goal1').classList.remove('error');
   document.getElementById('goal1Error').style.display = 'none';
   document.getElementById('goal2').classList.remove('error');
@@ -1117,7 +1131,6 @@ function recalcMachines() {
   let goalBased = null;
   let profitBased = null;
 
-  // ── Goal-based: weighted average
   if (goals.length > 0) {
     let weightedSum = 0;
     let weightTotal = 0;
@@ -1129,7 +1142,6 @@ function recalcMachines() {
     goalBased = weightedSum / weightTotal;
   }
 
-  // ── Profit-based
   if (desiredProfit > 0) {
     profitBased = desiredProfit / PROFIT_PER_MACHINE;
   }
@@ -1191,7 +1203,6 @@ function adjustCounter(val, delta) {
   counts[val] = newVal;
   if (newVal === 0) delete counts[val];
 
-  // Update display
   const countEl = document.getElementById('prop-count-' + val);
   const card = document.getElementById('prop-card-' + val);
   if (countEl) {
@@ -1226,7 +1237,6 @@ function renderUnitInputs() {
   }
   wrapper.style.display = 'block';
 
-  // Preserve existing values on re-render
   const existingUnits = {};
   const existingMachines = {};
   container.querySelectorAll('input[data-key]').forEach(inp => {
@@ -1238,7 +1248,6 @@ function renderUnitInputs() {
 
   if (!state.routePlacements) state.routePlacements = {};
 
-  // Remove placement entries for prop:idx pairs that no longer exist
   const validKeys = new Set();
   activeProps.forEach(([prop, count]) => {
     for (let i = 0; i < count; i++) validKeys.add(prop + ':' + i);
@@ -1308,7 +1317,7 @@ function updateRoutePlacementMachine(select) {
 }
 
 // ══════════════════════════════════
-//  STEP 2: DENSITY (Location Type)
+//  STEP 2: DENSITY
 // ══════════════════════════════════
 function selectDensity(el) {
   document.querySelectorAll('[data-val]').forEach(c => {
@@ -1327,7 +1336,6 @@ function selectDensity(el) {
 function computeProjection() {
   const $$ = v => '$' + Math.round(v).toLocaleString();
 
-  // Use only valid placements for revenue
   const placements = Object.values(state.routePlacements || {}).filter(p => p.property && p.machine && p.units > 0);
   const machineCount = placements.length;
 
@@ -1337,7 +1345,6 @@ function computeProjection() {
     totalMonthlyRev += Math.round(dpm * p.units);
   });
 
-  // Financial calculations
   const annualRev = totalMonthlyRev * 12;
   const cogs = annualRev * 0.35;
   const saas = annualRev * 0.105;
@@ -1353,7 +1360,7 @@ function computeProjection() {
   const tags = [
     '<strong>' + machineCount + '</strong> machines',
     'Market: <strong>' + densityName + '</strong>',
-    state.goal1 ? 'Goal: <strong>' + goalLabel(state.goal1) + '</strong>' : '',
+    state.goal1 ? 'Goal: <strong>' + (GOAL_LABELS[state.goal1] || state.goal1) + '</strong>' : '',
   ].filter(t => t).map(t => '<div class="proj-summary-tag">' + t + '</div>').join('');
   document.getElementById('projTags').innerHTML = tags;
 
@@ -1361,7 +1368,7 @@ function computeProjection() {
   document.getElementById('monthlyProfit').textContent = $$(monthlyProfit);
   document.getElementById('yearlyProfit').textContent = $$(annualProfit);
 
-  // Breakdown table
+  // Breakdown
   const tbl = document.getElementById('projTable');
   tbl.innerHTML =
     row('Annual Gross Revenue', $$(annualRev), 'pos') +
@@ -1371,8 +1378,20 @@ function computeProjection() {
     row('Insurance ($100/mo)', '−' + $$(insurance), 'neg') +
     rowTotal('Annual Take-Home Profit', $$(annualProfit), 'pos');
 
-  // Cost of waiting = monthly profit
   document.getElementById('costOfWaitingNum').textContent = $$(monthlyProfit);
+
+  // Stash for the sheet
+  state.projection = {
+    monthly_revenue: totalMonthlyRev,
+    annual_revenue: annualRev,
+    monthly_profit: Math.round(monthlyProfit),
+    annual_profit: Math.round(annualProfit),
+    cost_of_waiting: Math.round(monthlyProfit),
+    num_machines: machineCount,
+  };
+
+  // Final send — Step 3 values now land in the sheet
+  sendToSheet(3, 'completed');
 }
 
 function row(label, value, cls) {
@@ -1382,49 +1401,66 @@ function rowTotal(label, value, cls) {
   return '<div class="proj-row total"><div class="proj-row-label">' + label + '</div><div class="proj-row-value ' + (cls || '') + '">' + value + '</div></div>';
 }
 
-function goalLabel(g) {
-  return ({
-    supplemental: 'Supplemental Income',
-    replace: 'Replace Day Job',
-    family: 'Family Business',
-    scale: 'Scale & Sell',
-  })[g] || g;
-}
+// ══════════════════════════════════
+//  GOOGLE SHEET POST
+// ══════════════════════════════════
+function sendToSheet(stepNum, status) {
+  const placementsArray = Object.entries(state.routePlacements || {})
+    .filter(([k, p]) => p.property && (p.units || p.machine))
+    .map(([k, p]) => ({
+      property: PROP_NAME_MAP[p.property] || p.property,
+      machine: MACH_NAME_MAP[p.machine] || p.machine || '',
+      units: p.units || 0,
+    }));
 
-// ══════════════════════════════════
-//  GOOGLE SHEET (placeholder)
-// ══════════════════════════════════
-function sendToSheet(stepNum) {
-  // Placeholder — wire up SHEET_WEBHOOK_URL when ready.
-  // Built so the existing payload shape can grow without restructuring.
-  if (!SHEET_WEBHOOK_URL || SHEET_WEBHOOK_URL.includes('PLACEHOLDER')) {
-    // No-op for now — log so you can verify trigger points while testing.
-    console.log('[sendToSheet stub] step:', stepNum, 'state:', JSON.parse(JSON.stringify(state)));
+  // Most-common machine for the summary column
+  const machineCounts = {};
+  placementsArray.forEach(p => {
+    if (p.machine) machineCounts[p.machine] = (machineCounts[p.machine] || 0) + 1;
+  });
+  const topMachine = Object.entries(machineCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+
+  const payload = {
+    session_id: state.session_id,
+    timestamp: new Date().toISOString(),
+    current_step: stepNum,
+    current_step_name: STEP_NAMES_MAP[stepNum] || '',
+    status: status || (stepNum === TOTAL_STEPS ? 'completed' : 'in_progress'),
+
+    // Step 1
+    name: document.getElementById('fnName')?.value.trim() || '',
+    email: document.getElementById('fnEmail')?.value.trim() || '',
+    phone: document.getElementById('fnPhone')?.value.trim() || '',
+    city: document.getElementById('fnCity')?.value.trim() || '',
+    background: document.getElementById('fnBackground')?.value.trim() || '',
+
+    // Step 2
+    goal_1: GOAL_LABELS[state.goal1] || state.goal1 || '',
+    goal_2: GOAL_LABELS[state.goal2] || state.goal2 || '',
+    desired_monthly_profit: state.desiredProfit || '',
+    recommended_machines: state.recommendedMachines || '',
+    num_machines: state.projection?.num_machines || placementsArray.length || '',
+    market_density: DENSITY_NAME_MAP[state.density] || '',
+    route_placements: JSON.stringify(placementsArray),
+
+    // Step 3
+    est_monthly_revenue: state.projection?.monthly_revenue || '',
+    est_annual_revenue: state.projection?.annual_revenue || '',
+    est_monthly_profit: state.projection?.monthly_profit || '',
+    est_annual_profit: state.projection?.annual_profit || '',
+    cost_of_waiting: state.projection?.cost_of_waiting || '',
+  };
+
+  if (!SHEET_WEBHOOK_URL || SHEET_WEBHOOK_URL.includes('YOUR_DEPLOYMENT_ID')) {
+    console.log('[sendToSheet stub] step:', stepNum, 'payload:', payload);
     return;
   }
 
-  const formData = {
-    step: stepNum,
-    name: document.getElementById('fnName')?.value || '',
-    phone: document.getElementById('fnPhone')?.value || '',
-    email: document.getElementById('fnEmail')?.value || '',
-    city: document.getElementById('fnCity')?.value || '',
-    background: document.getElementById('fnBackground')?.value || '',
-    goal1: state.goal1,
-    goal2: state.goal2,
-    desiredProfit: state.desiredProfit,
-    machines: state.machines,
-    density: state.density,
-    routePlacements: state.routePlacements,
-    timestamp: new Date().toISOString(),
-  };
-
-  // Fire-and-forget POST
   fetch(SHEET_WEBHOOK_URL, {
     method: 'POST',
     mode: 'no-cors',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(formData),
+    body: JSON.stringify(payload),
   }).catch(err => console.warn('Sheet send failed:', err));
 }
 </script>
