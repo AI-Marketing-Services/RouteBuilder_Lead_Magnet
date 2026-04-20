@@ -505,6 +505,34 @@ select.form-input {
     </div>
   </div>
 
+  <!-- ══ OTP VERIFICATION (interstitial between Step 1 and Step 2) ══ -->
+  <div class="step-screen" id="step-otp">
+    <div class="step-eyebrow">Verify Your Email</div>
+    <h1 class="step-title">Check your inbox.</h1>
+    <p class="step-desc">We sent a 6-digit code to <strong id="otpEmailDisplay"></strong>. Enter it below to continue.</p>
+
+    <div class="form-row single">
+      <div class="form-field">
+        <label class="form-label">Verification Code <span class="required-star">*</span></label>
+        <input class="form-input" type="text" id="otpCode" placeholder="000000" maxlength="6" inputmode="numeric"
+               style="font-size:24px;letter-spacing:8px;text-align:center;font-weight:700;"
+               oninput="this.value=this.value.replace(/\D/g,''); clearOtpError();"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();verifyOtp();}">
+        <span class="field-error" id="otpError">Incorrect code.</span>
+      </div>
+    </div>
+
+    <p style="font-size:13px;color:var(--text-mid);margin-top:8px;">
+      Didn't get it? <a href="#" onclick="resendOtp();return false;" style="color:var(--primary);font-weight:600;text-decoration:none;">Resend code</a>
+      <span id="otpResendMsg" style="margin-left:8px;"></span>
+    </p>
+
+    <div class="step-nav">
+      <button class="btn-back" onclick="backFromOtp()">← Back</button>
+      <button class="btn-next" id="otpVerifyBtn" onclick="verifyOtp()">Verify <span class="btn-next-arrow">→</span></button>
+    </div>
+  </div>
+
   <!-- ══ STEP 2: GOALS & ROUTE ══ -->
   <div class="step-screen" id="step-2">
     <div class="step-eyebrow">Step 2 of 3 — Goals &amp; Route</div>
@@ -675,7 +703,10 @@ select.form-input {
 // ══════════════════════════════════
 //  CONFIG
 // ══════════════════════════════════
-const SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyksTv1BOgViYujucy92mE7ieLjy9EWVGAFh123iFat2Um7UxaweN15QQQf74oPiYtmrw/exec';
+const SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbxy2_bjDqSlO40b2Z-wUgD6iW8zutzL75QcRJFv8FMwYk-yGs_VSK93PRV0SKz26JFXqQ/exec';
+
+// OTP verification endpoint — same Apps Script handles this via { action: 'sendOtp' | 'verifyOtp' }
+const OTP_WEBHOOK_URL = SHEET_WEBHOOK_URL;
 
 // ══════════════════════════════════
 //  SESSION ID — persisted so refreshes keep the same sheet row
@@ -939,9 +970,15 @@ function showStep(id) {
   updateProgress();
 }
 
-function nextStep() {
+async function nextStep() {
+  // Step 1 → gate behind OTP verification
+  if (state.step === 1) {
+    if (!validateStep1()) return;
+    await requestOtpAndGoToOtpScreen();
+    return;
+  }
+
   // Validate current step
-  if (state.step === 1 && !validateStep1()) return;
   if (state.step === 2 && !validateStep2()) return;
 
   // Send the step we're leaving
@@ -972,6 +1009,161 @@ function jumpToStep(n) {
   state.step = n;
   showStep('step-' + n);
   if (n === 3) computeProjection();
+}
+
+// ══════════════════════════════════
+//  OTP VERIFICATION
+// ══════════════════════════════════
+// State: once the user has verified their email in this session, we skip the
+// OTP gate on subsequent Step 1 → Step 2 transitions (e.g. if they go back,
+// edit their name, and hit Continue again).
+state.otpVerifiedEmail = null;
+
+async function requestOtpAndGoToOtpScreen() {
+  const email = document.getElementById('fnEmail').value.trim();
+
+  // Already verified this exact email this session? Skip straight to Step 2.
+  if (state.otpVerifiedEmail && state.otpVerifiedEmail.toLowerCase() === email.toLowerCase()) {
+    sendToSheet(1, 'in_progress');
+    state.step = 2;
+    if (state.step > state.maxVisited) state.maxVisited = state.step;
+    showStep('step-2');
+    return;
+  }
+
+  const btn = document.querySelector('#step-1 .btn-next');
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = 'Sending code...';
+
+  const ok = await sendOtp(email);
+
+  btn.disabled = false;
+  btn.innerHTML = originalHtml;
+
+  if (!ok) {
+    alert('We couldn\'t send the verification code. Please check your email and try again.');
+    return;
+  }
+
+  // Fire the Step 1 sheet write BEFORE moving on (preserves session continuity)
+  sendToSheet(1, 'in_progress');
+
+  document.getElementById('otpEmailDisplay').textContent = email;
+  document.getElementById('otpCode').value = '';
+  clearOtpError();
+  document.getElementById('otpResendMsg').textContent = '';
+  showStep('step-otp');
+  setTimeout(() => document.getElementById('otpCode').focus(), 200);
+}
+
+async function sendOtp(email) {
+  if (!OTP_WEBHOOK_URL || OTP_WEBHOOK_URL.includes('YOUR_DEPLOYMENT_ID')) {
+    console.warn('[OTP] webhook URL not configured — skipping (stub mode: any 6-digit code will work)');
+    return true;
+  }
+  try {
+    // Use GET (simple request, no preflight, readable response cross-origin)
+    const url = OTP_WEBHOOK_URL + '?action=sendOtp&email=' + encodeURIComponent(email);
+    const res = await fetch(url, { method: 'GET' });
+    const data = await res.json();
+    if (!data.success) console.warn('[OTP] server reported failure:', data.error);
+    return !!data.success;
+  } catch (err) {
+    console.error('[OTP] send failed:', err);
+    return false;
+  }
+}
+
+async function verifyOtp() {
+  const email = document.getElementById('fnEmail').value.trim();
+  const code = document.getElementById('otpCode').value.trim();
+  const errEl = document.getElementById('otpError');
+
+  if (code.length !== 6) {
+    errEl.textContent = 'Please enter the 6-digit code.';
+    errEl.style.display = 'block';
+    document.getElementById('otpCode').classList.add('error');
+    return;
+  }
+
+  const btn = document.getElementById('otpVerifyBtn');
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = 'Verifying...';
+
+  // Stub mode: if the webhook isn't configured, accept any 6-digit code for local testing
+  if (!OTP_WEBHOOK_URL || OTP_WEBHOOK_URL.includes('YOUR_DEPLOYMENT_ID')) {
+    console.warn('[OTP] stub mode — accepting any 6-digit code');
+    await new Promise(r => setTimeout(r, 300));
+    state.otpVerifiedEmail = email;
+    state.step = 2;
+    if (state.step > state.maxVisited) state.maxVisited = state.step;
+    showStep('step-2');
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+    return;
+  }
+
+  try {
+    // Because Apps Script web apps don't send CORS headers, we need a readable
+    // response. Use a GET with query params (simple request, no preflight, readable).
+    const url = OTP_WEBHOOK_URL + '?action=verifyOtp'
+              + '&email=' + encodeURIComponent(email)
+              + '&code=' + encodeURIComponent(code);
+    const res = await fetch(url, { method: 'GET' });
+    const data = await res.json();
+
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+
+    if (!data.success) {
+      errEl.textContent = data.error || 'Incorrect code. Please try again.';
+      errEl.style.display = 'block';
+      document.getElementById('otpCode').classList.add('error');
+      return;
+    }
+
+    // Success — remember this email is verified and advance to Step 2
+    state.otpVerifiedEmail = email;
+    state.step = 2;
+    if (state.step > state.maxVisited) state.maxVisited = state.step;
+    showStep('step-2');
+  } catch (err) {
+    console.error('[OTP] verify failed:', err);
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+    errEl.textContent = 'Network error. Please try again.';
+    errEl.style.display = 'block';
+  }
+}
+
+async function resendOtp() {
+  const email = document.getElementById('fnEmail').value.trim();
+  const msgEl = document.getElementById('otpResendMsg');
+  msgEl.style.color = 'var(--text-mid)';
+  msgEl.textContent = 'Sending...';
+
+  const ok = await sendOtp(email);
+
+  if (ok) {
+    msgEl.style.color = 'var(--green)';
+    msgEl.textContent = '✓ New code sent.';
+  } else {
+    msgEl.style.color = 'var(--red)';
+    msgEl.textContent = 'Failed to resend.';
+  }
+  setTimeout(() => { msgEl.textContent = ''; }, 4000);
+}
+
+function backFromOtp() {
+  // Return to Step 1 — user can correct email address if needed
+  showStep('step-1');
+}
+
+function clearOtpError() {
+  document.getElementById('otpError').style.display = 'none';
+  document.getElementById('otpCode').classList.remove('error');
 }
 
 // ══════════════════════════════════
